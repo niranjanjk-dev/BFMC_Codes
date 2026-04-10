@@ -70,8 +70,8 @@ except ImportError:
 def launch_v2x_servers():
     """Launch V2X infrastructure as background subprocesses."""
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    server_dir = os.path.join(base_dir, "servers", "trafficCommunicationServer")
-    sim_dir = os.path.join(base_dir, "servers", "carsAndSemaphoreStreamSIM")
+    server_dir = os.path.join(base_dir, "..", "servers", "trafficCommunicationServer")
+    sim_dir = os.path.join(base_dir, "..", "servers", "carsAndSemaphoreStreamSIM")
 
     procs = []
     print("\n--- Starting V2X Servers ---")

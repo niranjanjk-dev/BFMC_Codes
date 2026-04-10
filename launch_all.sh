@@ -22,6 +22,6 @@ sleep 1
 
 echo "[3/3] Launching Main Car Application..."
 # Launch the Tkinter dashboard, camera, and autonomous pipeline
-lxterminal --title="BFMC 2026 Dashboard" -e "bash -c 'cd $BASE_DIR && python main.py; exec bash'" &
+lxterminal --title="BFMC 2026 Dashboard" -e "bash -c 'cd $BASE_DIR && python src/main.py; exec bash'" &
 
 echo "All services launched in separate windows!"
