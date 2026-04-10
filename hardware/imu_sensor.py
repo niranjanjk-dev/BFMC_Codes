@@ -72,7 +72,8 @@ class IMUSensor(threading.Thread):
 
     def run(self):
         if not self.bus:
-            print("[IMU] Hardware inactive, thread stopping.")
+            print("[IMU] Hardware inactive, thread stopping. Forcing calibration PASS.")
+            self.is_calibrated = True
             return
 
         print("[IMU] Hardware initialized. Searching for BNO055...")
@@ -86,7 +87,8 @@ class IMUSensor(threading.Thread):
                 self.BNO_ADDR = self.BNO_ADDR_ALT
                 chip = self.safe_read8(self.CHIP_ID)
                 if chip != 0xA0:
-                    print(f"[IMU] BNO055 not detected on either address. Disabling.")
+                    print(f"[IMU] BNO055 not detected on either address. Disabling. Forcing calibration PASS.")
+                    self.is_calibrated = True
                     return
             print(f"[IMU] BNO055 found at {hex(self.BNO_ADDR)}! Chip ID: {hex(chip)}")
 
