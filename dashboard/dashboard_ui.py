@@ -98,7 +98,17 @@ class DashboardUI:
         self.btn_parking = tk.Checkbutton(adas_frm, text="🏁 AUTO-REVERSE PARKING (10s)", variable=self.chk_parking, bg=THEME["danger"], fg="white", selectcolor="#333", font=("Helvetica", 10, "bold"))
         self.btn_parking.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
         
-        states = [("🛑 STOP", "stop_sign"), ("⛔ NO ENTRY", "no_entry"), ("🚸 PEDESTRIAN", "pedestrian"), ("🔴 RED LGT", "red_light"), ("🟡 YEL LGT", "yellow_light"), ("🟢 GRN LGT", "green_light"), ("⚠️ CAUTION", "caution"), ("🛣️ HIGHWAY", "highway"), ("🅿️ AUTO-PARK", "park"), ("🏎️ OVERTAKE", "overtake")]
+        # Parking Method Selector
+        park_method_frm = tk.Frame(adas_frm, bg=THEME["panel"])
+        park_method_frm.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
+        tk.Label(park_method_frm, text="Parking Method:", bg=THEME["panel"], fg="#ccc", font=("Helvetica", 9, "bold")).pack(side=tk.LEFT, padx=(0, 5))
+        self.var_parking_method = tk.StringVar(value="CSV")
+        park_csv_rb = tk.Radiobutton(park_method_frm, text="📄 CSV File", variable=self.var_parking_method, value="CSV", bg=THEME["panel"], fg="white", selectcolor="#444", indicatoron=0, font=("Helvetica", 9, "bold"), padx=8)
+        park_csv_rb.pack(side=tk.LEFT, padx=2)
+        park_builtin_rb = tk.Radiobutton(park_method_frm, text="⚙️ Built-in", variable=self.var_parking_method, value="BUILTIN", bg=THEME["panel"], fg="white", selectcolor="#444", indicatoron=0, font=("Helvetica", 9, "bold"), padx=8)
+        park_builtin_rb.pack(side=tk.LEFT, padx=2)
+        
+        states = [("🛑 STOP", "stop_sign"), ("⛔ NO ENTRY", "no_entry"), ("🚸 PEDESTRIAN", "pedestrian"), ("🔴 RED LGT", "red_light"), ("🟡 YEL LGT", "yellow_light"), ("🟢 GRN LGT", "green_light"), ("⚠️ CAUTION", "caution"), ("🛣️ HIGHWAY", "highway"), ("🅿️ AUTO-PARK", "park"), ("🏎️ OVERTAKE", "overtake"), ("🔍 SLOT DETECT", "slot_detect")]
         grid_frm = tk.Frame(adas_frm, bg=THEME["panel"])
         grid_frm.pack(fill=tk.BOTH, expand=True, padx=2, pady=4)
         for i, (text, key) in enumerate(states):
@@ -223,7 +233,11 @@ class DashboardUI:
         """Update dashboard glowing indicators based on a list of active keys."""
         for key, (c, dot) in self.indicators.items():
             if key in active_keys:
-                c.itemconfig(dot, fill=THEME["success"])
+                # Slot detect uses amber/orange to indicate scanning mode
+                if key == "slot_detect":
+                    c.itemconfig(dot, fill=THEME["warning"])
+                else:
+                    c.itemconfig(dot, fill=THEME["success"])
             else:
                 c.itemconfig(dot, fill="#333333")
 

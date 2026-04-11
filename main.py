@@ -57,6 +57,12 @@ except ImportError:
     _AUTO_DRIVE_AVAILABLE = False
 
 try:
+    from perception.parking_slot_detector import SlotDetector
+    _SLOT_DETECTOR_AVAILABLE = True
+except ImportError:
+    _SLOT_DETECTOR_AVAILABLE = False
+
+try:
     from traffic.traffic_module import TrafficDecisionEngine, ThreadedYOLODetector
     from traffic.behavior_controller import BehaviorController
     _AI_AVAILABLE = True
@@ -150,6 +156,15 @@ class BFMC_App:
         self.is_playing_back = False
         self.is_parking_reverse_mode = False
         self.playback_queue = []; self.playback_cmd = None; self.playback_frames = 0
+
+        # Slot Detection State
+        self.slot_detector = SlotDetector() if _SLOT_DETECTOR_AVAILABLE else None
+        self.is_searching_slot = False        # True when scanning for parking slot
+        self.slot_search_start_time = 0.0     # When slot search began
+        self.slot_confirm_count = 0           # Consecutive frames with slot detected
+        self.SLOT_CONFIRM_THRESHOLD = 3       # Need 3 consecutive frames to confirm
+        self.SLOT_SEARCH_TIMEOUT = 60.0       # Give up after 60 seconds
+        self.slot_detected_frame = None        # Frame with slot detection overlay
 
         # Autonomous Pipelines (Lane Detection)
         self.is_auto_mode    = False
@@ -268,12 +283,139 @@ class BFMC_App:
             self.render_map()
 
     def execute_parking_playback(self, reverse=False):
+        """Dispatch parking execution to the selected method (CSV or Built-in)."""
+        method = "CSV"
+        if not self.headless and hasattr(self.ui, 'var_parking_method'):
+            method = self.ui.var_parking_method.get()
+        
+        if method == "BUILTIN":
+            self._execute_builtin_parking(reverse)
+        else:
+            self._execute_csv_parking(reverse)
+
+    def _get_builtin_parking_sequence(self):
+        """
+        Built-in hardcoded parking maneuver sequence.
+        Each step: (speed_pwm, steering_angle_deg, duration_seconds)
+        
+        - speed > 0 = forward, speed < 0 = reverse, speed = 0 = stop
+        - steering: negative = left, positive = right
+        - duration: how long to hold these values (seconds)
+        
+        Values derived from default_parking.csv analysis.
+        Tune these values on the real car as needed.
+        """
+        # ── PARALLEL PARKING SEQUENCE ──────────────────────────────────
+        # Phase 1: Approach — drive forward, align with slot
+        # Phase 2: Steer right into slot (reverse)
+        # Phase 3: Counter-steer left to straighten (reverse)
+        # Phase 4: Pull forward to center in slot
+        # Phase 5: Final stop in parked position
+        sequence = [
+            # ── Phase 0: Brief stop (settle) ──────────────────────────
+            (   0.0,    0.0,   1.25),   # Stop for 1.25s (stabilize)
+            
+            # ── Phase 1: Drive forward past the slot ──────────────────
+            ( 200.0,    0.0,   1.75),   # Forward straight at 200 PWM for 1.75s
+            
+            # ── Phase 2: Steer right into the slot (forward arc) ──────
+            ( 200.0,  -20.0,   1.60),   # Forward + full left steer (-20°) for 1.6s
+            
+            # ── Phase 3: Straighten steering while still forward ──────
+            ( 170.0,   -5.0,   0.30),   # Ease off steering
+            ( 100.0,    0.0,   0.25),   # Straight, decelerating
+            (  50.0,    5.0,   0.25),   # Slight right correction
+            (   0.0,    0.0,   0.10),   # Brief stop
+            
+            # ── Phase 4: Reverse into the slot (right steer) ─────────
+            (-200.0,  -20.0,   0.60),   # Reverse + left steer for 0.6s
+            (-200.0,  -20.0,   0.25),   # Continue reverse turn
+            
+            # ── Phase 5: Counter-steer while reversing ────────────────
+            (-170.0,   -5.0,   0.35),   # Ease off steering in reverse
+            ( -80.0,    5.0,   0.25),   # Slight right in reverse
+            (   0.0,   10.0,   0.10),   # Brief stop
+            
+            # ── Phase 6: Pull forward with right steer to align ───────
+            ( 200.0,   20.0,   0.80),   # Forward + full right steer for 0.8s
+            ( 150.0,   20.0,   0.30),   # Continue forward right
+            ( 100.0,   10.0,   0.30),   # Ease steering
+            (  50.0,    5.0,   0.25),   # Decelerating
+            (   0.0,    0.0,   0.10),   # Brief stop
+            
+            # ── Phase 7: Reverse with left steer (final tuck) ─────────
+            (-200.0,  -20.0,   1.15),   # Reverse + full left for 1.15s
+            (-170.0,  -10.0,   0.30),   # Ease off
+            ( -80.0,   -5.0,   0.25),   # Decelerating
+            (   0.0,    0.0,   0.10),   # Brief stop
+            
+            # ── Phase 8: Final forward straighten ─────────────────────
+            ( 200.0,    5.0,   0.40),   # Forward slight right
+            ( 200.0,    0.0,   0.20),   # Forward straight
+            ( 100.0,    0.0,   0.25),   # Decelerating
+            (   0.0,    0.0,   0.15),   # Brief stop
+            
+            # ── Phase 9: Final reverse adjust ─────────────────────────
+            (-200.0,  -20.0,   0.65),   # Reverse left to finalize angle
+            (-100.0,  -10.0,   0.30),   # Ease off
+            (   0.0,    0.0,   1.75),   # PARKED — hold stop for 1.75s
+        ]
+        return sequence
+
+    def _execute_builtin_parking(self, reverse=False):
+        """Execute the built-in hardcoded parking sequence with time-based steps."""
+        sequence = self._get_builtin_parking_sequence()
+        
+        # Convert time-based sequence to frame-based commands (loop runs at ~20Hz = 50ms/frame)
+        FRAME_PERIOD = 0.05  # 50ms per frame
+        
+        commands = []
+        for speed, steer, duration_s in sequence:
+            num_frames = max(1, int(round(duration_s / FRAME_PERIOD)))
+            direction = 1 if speed >= 0 else -1
+            if speed == 0:
+                direction = 0
+            commands.append({
+                "speed": abs(speed),
+                "steer": steer,
+                "pwm": abs(speed),
+                "direction": direction,
+                "duration_fr": num_frames
+            })
+        
+        self.playback_queue = []
+        
+        if reverse:
+            for cmd in reversed(commands):
+                self.playback_queue.append({
+                    "speed": cmd["speed"],
+                    "steer": -cmd["steer"],
+                    "pwm": cmd["pwm"],
+                    "direction": -1 if cmd["direction"] == 1 else (1 if cmd["direction"] == -1 else 0),
+                    "duration_fr": cmd["duration_fr"]
+                })
+            self.is_parking_reverse_mode = True
+        else:
+            self.playback_queue = commands
+            self.is_parking_reverse_mode = False
+
+        self.is_playing_back = True
+        self.is_auto_mode = False
+        self.is_calibrating = False
+        
+        if not self.headless:
+            mode_str = "REVERSE" if reverse else "FORWARD"
+            self.ui.log_event(f"Starting {mode_str} parking (BUILT-IN)...", "SUCCESS")
+
+    def _execute_csv_parking(self, reverse=False):
         """Reads default_parking.csv and enqueues commands. Handles steering inversion for reverse."""
         filename = "default_parking.csv"
         
         if not os.path.exists(filename):
             if not self.headless:
-                self.ui.log_event(f"Error: {filename} not found!", "WARN")
+                self.ui.log_event(f"Error: {filename} not found! Falling back to built-in.", "WARN")
+            # Fallback to built-in if CSV not found
+            self._execute_builtin_parking(reverse)
             return
 
         commands = []
@@ -286,7 +428,7 @@ class BFMC_App:
                         "steer": float(row.get("steering", row.get("steer", 0))),
                         "pwm": float(row.get("pwm", 0.0)),
                         "direction": int(row.get("direction", 1)),
-                        "duration_fr": int(row.get("duration_fr", 1))
+                        "duration_fr": int(row.get("duration_fr", row.get("duration_frames", 1)))
                     })
         except Exception as e:
             if not self.headless:
@@ -316,7 +458,7 @@ class BFMC_App:
         
         if not self.headless:
             mode_str = "REVERSE" if reverse else "FORWARD"
-            self.ui.log_event(f"Starting {mode_str} parking playback...", "SUCCESS")
+            self.ui.log_event(f"Starting {mode_str} parking (CSV)...", "SUCCESS")
 
     def render_map(self):
         if self.headless: return
@@ -449,12 +591,17 @@ class BFMC_App:
                 elif "priority" in active_sign_cmd.lower():
                     self.priority_timer = time.time() + 10.0
                 elif "park" in active_sign_cmd.lower():
-                    if not getattr(self, 'has_parked_here', False):
-                        self.execute_parking_playback(reverse=False)
-                        self.has_parked_here = True
+                    # Enter slot search mode instead of immediately parking
+                    if not getattr(self, 'has_parked_here', False) and not self.is_searching_slot and not self.is_playing_back:
+                        self.is_searching_slot = True
+                        self.slot_search_start_time = time.time()
+                        self.slot_confirm_count = 0
+                        if not self.headless:
+                            self.ui.log_event("🔍 SEARCH SLOT: Parking sign detected — slowing to 10% speed, scanning for slot...", "WARN")
             
             if not active_sign_cmd or "park" not in active_sign_cmd.lower():
-                self.has_parked_here = False
+                if not self.is_searching_slot:  # Don't reset while searching
+                    self.has_parked_here = False
             # ------------------------------------
             
             if active_sign_cmd and not self.headless:
@@ -463,6 +610,38 @@ class BFMC_App:
                     self.last_logged_cmd = active_sign_cmd
             elif not active_sign_cmd:
                 self.last_logged_cmd = None
+
+            # ── SLOT DETECTION PROCESSING ──────────────────────────
+            slot_found_this_frame = False
+            if self.is_searching_slot and self.slot_detector and frame is not None:
+                # Get YOLO detections for occupancy check
+                yolo_dets = []
+                if t_res and hasattr(t_res, 'detections'):
+                    yolo_dets = t_res.detections if t_res.detections else []
+                elif t_res and hasattr(t_res, 'active_labels'):
+                    # Build minimal detection list from labels if full dets not available
+                    yolo_dets = []
+                
+                slot_found_this_frame, frame = self.slot_detector.detect_slot(frame, yolo_dets)
+                
+                if slot_found_this_frame:
+                    self.slot_confirm_count += 1
+                else:
+                    self.slot_confirm_count = max(0, self.slot_confirm_count - 1)
+                
+                # Check if slot is confirmed (seen in enough consecutive frames)
+                if self.slot_confirm_count >= self.SLOT_CONFIRM_THRESHOLD:
+                    self.is_searching_slot = False
+                    self.has_parked_here = True
+                    self.execute_parking_playback(reverse=False)
+                    if not self.headless:
+                        self.ui.log_event("✅ SLOT CONFIRMED! Starting parking maneuver...", "SUCCESS")
+                
+                # Check for timeout
+                elif time.time() - self.slot_search_start_time > self.SLOT_SEARCH_TIMEOUT:
+                    self.is_searching_slot = False
+                    if not self.headless:
+                        self.ui.log_event("⏰ SLOT SEARCH TIMEOUT: No valid slot found in 60s, resuming normal drive.", "WARN")
 
             # 5. Calculate Steering & Speed Control
             if self.is_auto_mode and not self.is_playing_back:
@@ -507,6 +686,10 @@ class BFMC_App:
                             target_speed *= 0.8
                         if is_highway:
                             target_speed *= 1.3
+                        
+                        # SLOT SEARCH: Slow to 10% speed while scanning
+                        if self.is_searching_slot:
+                            target_speed = base_speed * 0.10
                         # --------------------------------------------------------
                 else:
                     self.is_calibrating = True
@@ -515,6 +698,38 @@ class BFMC_App:
             # 6. Dashboard CAM + BEV Render
             if not self.headless:
                 final_cam = t_res.yolo_debug_frame if (t_res and getattr(t_res, 'yolo_debug_frame', None) is not None) else frame
+                
+                # Overlay slot detection on camera feed when searching
+                if self.is_searching_slot and final_cam is not None:
+                    h_cam, w_cam = final_cam.shape[:2]
+                    elapsed_search = time.time() - self.slot_search_start_time
+                    
+                    # Semi-transparent scanning overlay banner
+                    overlay = final_cam.copy()
+                    cv2.rectangle(overlay, (0, 0), (w_cam, 40), (0, 80, 160), -1)
+                    cv2.addWeighted(overlay, 0.6, final_cam, 0.4, 0, final_cam)
+                    
+                    # Scanning status text
+                    scan_text = f"SCANNING FOR SLOT... ({elapsed_search:.0f}s / {self.SLOT_SEARCH_TIMEOUT:.0f}s)"
+                    cv2.putText(final_cam, scan_text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    
+                    # Speed indicator
+                    cv2.putText(final_cam, "SPEED: 10%", (w_cam - 150, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 2)
+                    
+                    # Confirmation progress bar
+                    bar_x, bar_y, bar_w, bar_h = 10, h_cam - 30, w_cam - 20, 15
+                    progress = min(self.slot_confirm_count / self.SLOT_CONFIRM_THRESHOLD, 1.0)
+                    cv2.rectangle(final_cam, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (80, 80, 80), -1)
+                    fill_w = int(bar_w * progress)
+                    bar_color = (0, 255, 0) if progress >= 1.0 else (0, 200, 255)
+                    cv2.rectangle(final_cam, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), bar_color, -1)
+                    cv2.putText(final_cam, f"Slot Confirm: {self.slot_confirm_count}/{self.SLOT_CONFIRM_THRESHOLD}", (bar_x + 5, bar_y + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                    
+                    # Scanning region indicator lines
+                    cv2.line(final_cam, (int(w_cam*0.45), int(h_cam*0.55)), (int(w_cam*0.45), h_cam), (0, 255, 255), 1)
+                    cv2.putText(final_cam, "SCAN R", (int(w_cam*0.7), int(h_cam*0.52)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                    cv2.putText(final_cam, "SCAN L", (int(w_cam*0.2), int(h_cam*0.52)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                
                 final_cam = cv2.cvtColor(final_cam, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(final_cam).resize((440, 330))
                 self.ui.cam_label.imgtk = ImageTk.PhotoImage(image=img)
@@ -737,6 +952,10 @@ class BFMC_App:
                     
             if getattr(self, 'in_highway_mode', False) and 'highway' not in active_keys:
                 active_keys.append('highway')
+                
+            # Slot detection indicator
+            if self.is_searching_slot:
+                active_keys.append('slot_detect')
                 
             if behav_out:
                 ls = getattr(behav_out, 'light_status', '')
