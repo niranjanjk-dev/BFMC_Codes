@@ -53,12 +53,12 @@ class BehaviorOutput:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Overtake state machine
+# Overtake state machine — CITY (simple fixed-bias, dashed-line only)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class OvertakeStateMachine:
     """
-    Dashed-line obstacle overtake sequence:
+    Dashed-line obstacle overtake sequence (CITY mode):
       IDLE → CHANGE_LEFT → PASS → CHANGE_RIGHT → IDLE
 
     Timing is open-loop (duration-based). Steer biases are additive
@@ -109,6 +109,309 @@ class OvertakeStateMachine:
             return base_steer + self.STEER_BIAS_DEG, base_speed * self.SPEED_MULT, "OVERTAKE"
 
         return base_steer, base_speed, "NONE"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Highway Overtake FSM — Vision-Based Steering Calculation
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HighwayOvertakeFSM:
+    """
+    Camera-vision-based highway overtake system.
+
+    Uses the YOLO bounding box of the car ahead to mathematically compute
+    the optimal steering angle for a smooth overtake maneuver.
+
+    Mathematical Model
+    ------------------
+    Given a detected car with bounding box (x1, y1, x2, y2) in a frame of
+    width W and height H:
+
+      1. Lateral offset (pixels from our car's center):
+            car_cx      = (x1 + x2) / 2
+            lateral_px  = car_cx - W / 2     (positive = car is to the right)
+
+      2. Distance estimate from bbox height:
+            dist_m = (REAL_CAR_HEIGHT * FOCAL_LENGTH) / bbox_height
+
+      3. Lateral offset in metres:
+            lateral_m = lateral_px * dist_m / FOCAL_LENGTH
+
+      4. Required steering angle to move AWAY from the car:
+            θ_avoid = -atan2(lateral_m, dist_m)    (steer opposite direction)
+
+      5. Additional clearance bias:
+            θ_total = θ_avoid + CLEARANCE_BIAS * sign(lateral_px)
+
+    Lane Check
+    ----------
+    A car is considered "in our lane" only if:
+      - Its bbox center is within the central 60% of the frame horizontally
+      - Its bbox bottom is in the lower 50% of the frame (close enough)
+    If the car is NOT in our lane, no overtake is triggered.
+
+    States
+    ------
+      IDLE       — no overtake in progress
+      APPROACH   — car detected in lane, decelerating, computing steer angle
+      STEER_OUT  — steering away from the car (into opposite lane)
+      PASS       — car is beside us, maintain offset and speed up
+      STEER_BACK — returning to original lane
+      SETTLE     — brief straight drive to stabilize
+    """
+
+    # ── Timing ────────────────────────────────────────────────────────────
+    APPROACH_DURATION  = 0.8    # seconds to decelerate before lane change
+    STEER_OUT_DURATION = 1.5    # seconds to move into opposite lane
+    PASS_DURATION      = 2.0    # seconds to drive alongside / past
+    STEER_BACK_DURATION = 1.5   # seconds to return to original lane
+    SETTLE_DURATION    = 0.5    # seconds to drive straight after return
+
+    # ── Speed multipliers ─────────────────────────────────────────────────
+    APPROACH_SPEED_MULT = 0.65  # slow down during approach
+    MANEUVER_SPEED_MULT = 0.85  # slightly slower during lane change
+    PASS_SPEED_MULT     = 1.05  # speed up slightly to pass
+
+    # ── Camera / geometry constants ───────────────────────────────────────
+    REAL_CAR_HEIGHT_M   = 0.12  # Approximate height of BFMC model car (m)
+    FOCAL_LENGTH_PX     = 450.0 # Camera focal length in pixels
+    FRAME_WIDTH         = 640   # Expected frame width
+    FRAME_HEIGHT        = 480   # Expected frame height
+
+    # ── Lane detection thresholds ─────────────────────────────────────────
+    LANE_CENTER_RATIO   = 0.30  # Car is "in our lane" if within ±30% of center
+    LANE_PROXIMITY_Y    = 0.50  # Car must be in lower 50% of frame
+
+    # ── Steering limits ───────────────────────────────────────────────────
+    MAX_STEER_DEG       = 23.0  # Max steering angle for overtake
+    MIN_STEER_DEG       = 8.0   # Min steering angle (prevents tiny corrections)
+    CLEARANCE_OFFSET_M  = 0.15  # Extra lateral clearance during pass (metres)
+
+    def __init__(self):
+        self.state = "IDLE"
+        self._ts   = 0.0
+        self._computed_steer = 0.0    # Calculated optimal steer angle
+        self._overtake_side  = "LEFT" # Which side to overtake on
+        self._target_car_bbox = None  # Last known car bbox
+        self._target_car_dist = 0.0   # Estimated distance to car
+
+    @property
+    def active(self):
+        return self.state != "IDLE"
+
+    def check_car_in_lane(self, detections, frame_w=640, frame_h=480):
+        """
+        Check if any detected car/obstacle is in our lane and close enough
+        to require overtaking.
+
+        Returns
+        -------
+        (in_lane: bool, car_det: dict or None)
+        """
+        center_x = frame_w / 2.0
+        lane_left  = center_x - frame_w * self.LANE_CENTER_RATIO
+        lane_right = center_x + frame_w * self.LANE_CENTER_RATIO
+
+        best_car = None
+        best_dist = float('inf')
+
+        for d in detections:
+            label = d.get("label", "").lower()
+            if label not in ("car", "obstacle", "roadblock", "closed-road-stand"):
+                continue
+
+            x1, y1, x2, y2 = d.get("bbox", (0, 0, 0, 0))
+            car_cx = (x1 + x2) / 2.0
+            box_h  = y2 - y1
+
+            # Check 1: Is the car's center within our lane (central 60%)?
+            if car_cx < lane_left or car_cx > lane_right:
+                continue  # Car is in the other lane — no need to overtake
+
+            # Check 2: Is the car close enough (in lower portion of frame)?
+            if y2 < frame_h * self.LANE_PROXIMITY_Y:
+                continue  # Car is too far away
+
+            # Check 3: Is the car big enough to be real (not a tiny detection)?
+            if box_h < 20:
+                continue
+
+            # Pick the closest car (largest bbox = closest)
+            dist_m = self._estimate_distance(box_h)
+            if dist_m < best_dist:
+                best_dist = dist_m
+                best_car = d
+
+        return (best_car is not None), best_car
+
+    def _estimate_distance(self, box_h):
+        """Estimate distance to car from bounding box height."""
+        if box_h <= 0:
+            return 99.0
+        return (self.REAL_CAR_HEIGHT_M * self.FOCAL_LENGTH_PX) / box_h
+
+    def _compute_steering_angle(self, car_det, frame_w=640):
+        """
+        Compute the optimal steering angle to overtake the detected car.
+
+        Math:
+            1. Find lateral offset of car from frame center (pixels)
+            2. Convert to metres using distance estimate
+            3. Add clearance margin
+            4. Compute steering via atan2: θ = atan2(lateral_offset_m, distance_m)
+            5. Steer in the OPPOSITE direction to move away from the car
+
+        Returns
+        -------
+        (steer_angle_deg: float, side: str)
+            steer_angle_deg: positive = steer right, negative = steer left
+            side: "LEFT" or "RIGHT" (which side we overtake on)
+        """
+        x1, y1, x2, y2 = car_det.get("bbox", (0, 0, 0, 0))
+        box_h  = y2 - y1
+        car_cx = (x1 + x2) / 2.0
+        center_x = frame_w / 2.0
+
+        # Lateral offset in pixels (positive = car is to the right of us)
+        lateral_px = car_cx - center_x
+
+        # Distance to car (metres)
+        dist_m = self._estimate_distance(box_h)
+        dist_m = max(dist_m, 0.1)  # Safety floor
+
+        # Convert lateral offset to metres
+        # Using pinhole camera model: lateral_m = lateral_px * dist_m / focal_length
+        lateral_m = lateral_px * dist_m / self.FOCAL_LENGTH_PX
+
+        # Determine overtake side: go OPPOSITE to where the car is
+        # If car is to the right of center → overtake on the LEFT
+        # If car is to the left of center → overtake on the RIGHT
+        if lateral_px >= 0:
+            # Car is right of center → steer LEFT to overtake
+            side = "LEFT"
+            # Required lateral displacement = car's lateral position + clearance
+            target_lateral_m = -(abs(lateral_m) + self.CLEARANCE_OFFSET_M)
+        else:
+            # Car is left of center → steer RIGHT to overtake
+            side = "RIGHT"
+            target_lateral_m = abs(lateral_m) + self.CLEARANCE_OFFSET_M
+
+        # Compute steering angle using atan2
+        # θ = atan2(target_lateral_displacement, look_ahead_distance)
+        look_ahead_m = max(dist_m * 0.8, 0.3)  # Look slightly ahead of the car
+        steer_rad = math.atan2(target_lateral_m, look_ahead_m)
+        steer_deg = math.degrees(steer_rad)
+
+        # Clamp to safe range
+        steer_deg = max(-self.MAX_STEER_DEG, min(self.MAX_STEER_DEG, steer_deg))
+
+        # Enforce minimum steering angle to ensure meaningful lane change
+        if abs(steer_deg) < self.MIN_STEER_DEG:
+            steer_deg = self.MIN_STEER_DEG * (-1.0 if side == "LEFT" else 1.0)
+
+        return steer_deg, side
+
+    def trigger(self, now: float, car_det: dict, frame_w: int = 640):
+        """
+        Start the overtake maneuver with vision-computed steering.
+
+        Parameters
+        ----------
+        now     : current time
+        car_det : YOLO detection dict with 'bbox' key
+        frame_w : frame width for calculations
+        """
+        if self.state != "IDLE":
+            return
+
+        steer_deg, side = self._compute_steering_angle(car_det, frame_w)
+
+        self._computed_steer = steer_deg
+        self._overtake_side  = side
+        self._target_car_bbox = car_det.get("bbox", None)
+        self._target_car_dist = self._estimate_distance(
+            (car_det["bbox"][3] - car_det["bbox"][1]) if car_det.get("bbox") else 1
+        )
+
+        self.state = "APPROACH"
+        self._ts   = now
+        log.info(f"HWY OVERTAKE: triggered — side={side}, "
+                 f"steer={steer_deg:.1f}°, dist={self._target_car_dist:.2f}m")
+
+    def update(self, now: float, base_steer: float, base_speed: float,
+               detections: list = None, frame_w: int = 640):
+        """
+        Update the overtake FSM. Recalculates steering if car is still
+        visible during APPROACH and STEER_OUT phases.
+
+        Returns
+        -------
+        (steer_deg, speed_pwm, maneuver_label, state_str)
+        """
+        if self.state == "IDLE":
+            return base_steer, base_speed, "NONE", "IDLE"
+
+        elapsed = now - self._ts
+
+        # ── Live tracking: update steering if car still visible ───────
+        if detections and self.state in ("APPROACH", "STEER_OUT"):
+            in_lane, car_det = self.check_car_in_lane(detections, frame_w)
+            if car_det:
+                steer_deg, side = self._compute_steering_angle(car_det, frame_w)
+                # Smooth update (blend old and new to prevent jitter)
+                self._computed_steer = 0.7 * self._computed_steer + 0.3 * steer_deg
+                self._target_car_bbox = car_det.get("bbox", None)
+
+        # ── APPROACH: slow down before steering ───────────────────────
+        if self.state == "APPROACH":
+            if elapsed > self.APPROACH_DURATION:
+                self.state = "STEER_OUT"
+                self._ts = now
+                log.info(f"HWY OVERTAKE: steering out ({self._overtake_side})")
+            return base_steer, base_speed * self.APPROACH_SPEED_MULT, "OVERTAKE", "APPROACH"
+
+        # ── STEER_OUT: execute computed steering angle ────────────────
+        if self.state == "STEER_OUT":
+            if elapsed > self.STEER_OUT_DURATION:
+                self.state = "PASS"
+                self._ts = now
+                log.info("HWY OVERTAKE: passing")
+            return (base_steer + self._computed_steer,
+                    base_speed * self.MANEUVER_SPEED_MULT,
+                    "OVERTAKE", "STEER_OUT")
+
+        # ── PASS: drive alongside/past the car ────────────────────────
+        if self.state == "PASS":
+            if elapsed > self.PASS_DURATION:
+                self.state = "STEER_BACK"
+                self._ts = now
+                log.info("HWY OVERTAKE: steering back")
+            # Maintain slight offset in the same direction
+            hold_steer = self._computed_steer * 0.15
+            return (base_steer + hold_steer,
+                    base_speed * self.PASS_SPEED_MULT,
+                    "OVERTAKE", "PASS")
+
+        # ── STEER_BACK: return to original lane (opposite steering) ──
+        if self.state == "STEER_BACK":
+            if elapsed > self.STEER_BACK_DURATION:
+                self.state = "SETTLE"
+                self._ts = now
+                log.info("HWY OVERTAKE: settling")
+            # Mirror the original steering to come back
+            return_steer = -self._computed_steer * 0.85
+            return (base_steer + return_steer,
+                    base_speed * self.MANEUVER_SPEED_MULT,
+                    "OVERTAKE", "STEER_BACK")
+
+        # ── SETTLE: brief straight to stabilize ──────────────────────
+        if self.state == "SETTLE":
+            if elapsed > self.SETTLE_DURATION:
+                self.state = "IDLE"
+                log.info("HWY OVERTAKE: complete")
+            return base_steer, base_speed, "OVERTAKE", "SETTLE"
+
+        return base_steer, base_speed, "NONE", "IDLE"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -240,7 +543,8 @@ class BehaviorController:
         self._priority_until   : float = 0.0    # priority-road right-of-way expiry
         self._roundabout_active: bool  = False
         self._no_entry_active  : bool  = False
-        self.overtake_fsm   = OvertakeStateMachine()
+        self.overtake_fsm   = OvertakeStateMachine()       # City mode: fixed-bias
+        self.hwy_overtake_fsm = HighwayOvertakeFSM()       # Highway mode: vision-based
         self.parking_fsm    = ParkingSequenceFSM()
         self._last_state    = "NORMAL"
 
@@ -457,7 +761,38 @@ class BehaviorController:
                 maneuver  = "PARKING",
             )
 
-        # ── Overtake (dashed line + obstacle) ───────────────────────────
+        # ── Highway Overtake (vision-based steering) ──────────────────
+        # In highway mode: use HighwayOvertakeFSM which computes steering
+        # from the camera position of the car ahead. Only triggers if the
+        # car ahead is actually IN our lane.
+        if self._zone_mode == "HIGHWAY":
+            # Get raw YOLO detections (with bboxes) for lane check
+            all_dets = getattr(t_res, 'detections', []) or []
+
+            # Check if a car is in our lane
+            if not self.hwy_overtake_fsm.active:
+                in_lane, car_det = self.hwy_overtake_fsm.check_car_in_lane(
+                    all_dets if all_dets else []
+                )
+                if in_lane and car_det:
+                    self.hwy_overtake_fsm.trigger(now, car_det)
+
+            if self.hwy_overtake_fsm.active:
+                steer, speed, label, phase = self.hwy_overtake_fsm.update(
+                    now, base_steer, base_speed,
+                    detections=all_dets if all_dets else None
+                )
+                return BehaviorOutput(
+                    speed_pwm = speed,
+                    steer_deg = steer,
+                    priority  = self.PRI_MISSION,
+                    state     = f"HWY_OVERTAKE_{phase}",
+                    reason    = f"HIGHWAY OVERTAKE — {phase} (steer: {steer - base_steer:+.1f}°)",
+                    zone_mode = "HIGHWAY",
+                    maneuver  = "OVERTAKE",
+                )
+
+        # ── City Overtake (dashed line + obstacle, fixed bias) ───────
         if (t_res.state == "SYS_LANE_CHANGE_LEFT" and
                 not self.overtake_fsm.active):
             # Confirmed dashed line + obstacle in path

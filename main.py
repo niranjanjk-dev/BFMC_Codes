@@ -699,7 +699,8 @@ class BFMC_App:
             if not self.headless:
                 final_cam = t_res.yolo_debug_frame if (t_res and getattr(t_res, 'yolo_debug_frame', None) is not None) else frame
                 
-                # Overlay slot detection on camera feed when searching
+                # Overlay slot detection status banner when searching
+                # (BEV corner visualization is drawn by SlotDetector.detect_slot directly on the frame)
                 if self.is_searching_slot and final_cam is not None:
                     h_cam, w_cam = final_cam.shape[:2]
                     elapsed_search = time.time() - self.slot_search_start_time
@@ -710,8 +711,8 @@ class BFMC_App:
                     cv2.addWeighted(overlay, 0.6, final_cam, 0.4, 0, final_cam)
                     
                     # Scanning status text
-                    scan_text = f"SCANNING FOR SLOT... ({elapsed_search:.0f}s / {self.SLOT_SEARCH_TIMEOUT:.0f}s)"
-                    cv2.putText(final_cam, scan_text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    scan_text = f"BEV CORNER SCAN ({elapsed_search:.0f}s / {self.SLOT_SEARCH_TIMEOUT:.0f}s)"
+                    cv2.putText(final_cam, scan_text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
                     
                     # Speed indicator
                     cv2.putText(final_cam, "SPEED: 10%", (w_cam - 150, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 2)
@@ -724,11 +725,6 @@ class BFMC_App:
                     bar_color = (0, 255, 0) if progress >= 1.0 else (0, 200, 255)
                     cv2.rectangle(final_cam, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), bar_color, -1)
                     cv2.putText(final_cam, f"Slot Confirm: {self.slot_confirm_count}/{self.SLOT_CONFIRM_THRESHOLD}", (bar_x + 5, bar_y + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                    
-                    # Scanning region indicator lines
-                    cv2.line(final_cam, (int(w_cam*0.45), int(h_cam*0.55)), (int(w_cam*0.45), h_cam), (0, 255, 255), 1)
-                    cv2.putText(final_cam, "SCAN R", (int(w_cam*0.7), int(h_cam*0.52)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-                    cv2.putText(final_cam, "SCAN L", (int(w_cam*0.2), int(h_cam*0.52)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
                 
                 final_cam = cv2.cvtColor(final_cam, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(final_cam).resize((440, 330))

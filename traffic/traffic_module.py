@@ -49,6 +49,7 @@ class TrafficResult:
     pedestrian_blocking : True when pedestrian is holding us at a crosswalk.
     light_status    : dashboard string for the traffic-light colour.
     active_labels   : all YOLO class names seen this frame.
+    detections      : raw YOLO detection dicts with bbox data (for overtake)
     yolo_debug_frame: BGR frame with detection overlays.
     sign_approach_m : estimated approach distance to nearest sign (for dash)
     """
@@ -61,6 +62,7 @@ class TrafficResult:
     pedestrian_blocking: bool = False
     light_status: str = "NONE"
     active_labels: List[str] = field(default_factory=list)
+    detections: list = field(default_factory=list)
     yolo_debug_frame: np.ndarray = None
     sign_approach_m: float = 99.0   # estimated distance to nearest active sign
 
@@ -738,6 +740,7 @@ class TrafficDecisionEngine:
             pedestrian_blocking = ped_blocking,
             light_status     = light_st,
             active_labels    = act_lbl,
+            detections       = dets,
             yolo_debug_frame = dbg,
             sign_approach_m  = _nearest_sign_dist_m,
         )
