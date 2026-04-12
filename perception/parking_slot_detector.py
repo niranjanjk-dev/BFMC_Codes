@@ -7,18 +7,29 @@ BEV (warped) image and grouping them into rectangles.
 
 Algorithm:
   1. Convert BEV frame to grayscale and detect edges
-  2. Detect corners using Shi-Tomasi (goodFeaturesToTrack)
-  3. Cluster nearby corners to eliminate duplicates
-  4. Find groups of 4 corners that form valid rectangles
-  5. Validate rectangle aspect ratio and size against parking slot dimensions
-  6. Track confirmed slots across frames with EMA smoothing
-  7. Check occupancy against YOLO detections
+  2. Detect Hough Lines on BEV edges for full line visualization
+  3. Detect corners using Shi-Tomasi (goodFeaturesToTrack)
+  4. Cluster nearby corners to eliminate duplicates
+  5. Find groups of 4 corners that form valid rectangles
+  6. Validate rectangle aspect ratio and size against parking slot dimensions
+  7. Track confirmed slots across frames with EMA smoothing
+  8. Check occupancy against YOLO detections
+  9. Determine slot side (LEFT / RIGHT) relative to car's forward direction
 
 A valid parking slot is a rectangle where:
   - Width:  60–250 px (in BEV space)
   - Height: 100–400 px (in BEV space)
   - Aspect ratio (height/width): 1.2–5.0 (taller than wide)
   - Corners form approximately right angles (within tolerance)
+
+Visualization draws:
+  - All Hough lines (cyan)
+  - All raw corners before clustering (small red dots)
+  - Clustered corners (green crosshairs)
+  - Candidate rectangles — invalid (dim grey), valid occupied (red), valid free (yellow)
+  - Tracked / confirmed slots (bright green with thick borders)
+  - Slot side label (LEFT / RIGHT)
+  - Text annotations: corner count, line count, rectangle/slot counts
 """
 
 import cv2
@@ -51,11 +62,25 @@ class SlotDetector:
         # ── Cluster merge distance ───────────────────────────────────
         self.CLUSTER_DIST = 20             # px — merge corners closer than this
 
+        # ── Hough Line parameters ────────────────────────────────────
+        self.HOUGH_RHO = 1
+        self.HOUGH_THETA = np.pi / 180
+        self.HOUGH_THRESHOLD = 40
+        self.HOUGH_MIN_LINE_LEN = 30
+        self.HOUGH_MAX_LINE_GAP = 15
+
         # ── BEV perspective transform (same as lane detector) ────────
         self.SRC_PTS = np.float32([[200, 260], [440, 260], [40, 450], [600, 450]])
         self.DST_PTS = np.float32([[150, 0], [490, 0], [150, 480], [490, 480]])
         self.M_forward = cv2.getPerspectiveTransform(self.SRC_PTS, self.DST_PTS)
         self.M_inv = cv2.getPerspectiveTransform(self.DST_PTS, self.SRC_PTS)
+
+        # ── Last detected slot side ──────────────────────────────────
+        self._last_slot_side = "NONE"
+
+    # ══════════════════════════════════════════════════════════════════
+    #  PUBLIC API
+    # ══════════════════════════════════════════════════════════════════
 
     def detect_slot(self, frame, dets):
         """
@@ -68,10 +93,11 @@ class SlotDetector:
 
         Returns
         -------
-        (slot_found: bool, annotated_frame: np.ndarray)
+        (slot_found: bool, annotated_frame: np.ndarray, slot_side: str)
+            slot_side is "LEFT", "RIGHT", or "NONE"
         """
         if frame is None:
-            return False, frame
+            return False, frame, "NONE"
 
         h, w = frame.shape[:2]
 
@@ -91,10 +117,20 @@ class SlotDetector:
         # Light blur to reduce noise while preserving edges
         blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
 
-        # Edge detection for visualization
+        # Edge detection
         edges = cv2.Canny(blurred, 50, 150)
 
-        # ── Step 3: Detect corners (Shi-Tomasi) ──────────────────────
+        # ── Step 3: Hough Line detection (for visualization) ─────────
+        hough_lines = cv2.HoughLinesP(
+            edges,
+            rho=self.HOUGH_RHO,
+            theta=self.HOUGH_THETA,
+            threshold=self.HOUGH_THRESHOLD,
+            minLineLength=self.HOUGH_MIN_LINE_LEN,
+            maxLineGap=self.HOUGH_MAX_LINE_GAP
+        )
+
+        # ── Step 4: Detect corners (Shi-Tomasi) ──────────────────────
         corners = cv2.goodFeaturesToTrack(
             blurred,
             maxCorners=self.MAX_CORNERS,
@@ -104,34 +140,35 @@ class SlotDetector:
         )
 
         if corners is None or len(corners) < 4:
-            # Draw edges on BEV for debug
-            self._draw_bev_overlay(frame, bev, edges, [], [], "NO CORNERS")
-            return False, frame
+            self._draw_bev_overlay(frame, bev, edges, hough_lines,
+                                   None, [], [], [], "NO CORNERS")
+            return False, frame, "NONE"
 
-        # Flatten corners to (N, 2)
-        pts = corners.reshape(-1, 2)
+        # Raw corners (before clustering) for visualization
+        raw_pts = corners.reshape(-1, 2)
 
-        # ── Step 4: Cluster nearby corners ───────────────────────────
-        clustered = self._cluster_corners(pts)
+        # ── Step 5: Cluster nearby corners ───────────────────────────
+        clustered = self._cluster_corners(raw_pts)
 
         if len(clustered) < 4:
-            self._draw_bev_overlay(frame, bev, edges, clustered, [], "< 4 CLUSTERS")
-            return False, frame
+            self._draw_bev_overlay(frame, bev, edges, hough_lines,
+                                   raw_pts, clustered, [], [], "< 4 CLUSTERS")
+            return False, frame, "NONE"
 
-        # ── Step 5: Find rectangles from corner groups ───────────────
-        rectangles = self._find_rectangles(clustered)
+        # ── Step 6: Find rectangles from corner groups ───────────────
+        rectangles, invalid_rects = self._find_rectangles_with_rejects(clustered)
 
-        # ── Step 6: Validate and filter rectangles ───────────────────
+        # ── Step 7: Validate and filter rectangles ───────────────────
         valid_slots = []
         for rect in rectangles:
             if self._validate_slot_geometry(rect):
-                # Check occupancy via YOLO
                 occupied = self._check_occupancy(rect, dets, h, w)
                 valid_slots.append((rect, occupied))
 
-        # ── Step 7: Track slots and draw results ────────────────────
+        # ── Step 8: Track slots and determine side ───────────────────
         slot_found = False
         free_slots = []
+        slot_side = "NONE"
 
         for rect, occupied in valid_slots:
             if not occupied:
@@ -141,11 +178,27 @@ class SlotDetector:
         # Update tracked slots with EMA
         self._update_tracking(free_slots)
 
-        # ── Step 8: Draw visualization on frame ─────────────────────
-        self._draw_bev_overlay(frame, bev, edges, clustered, valid_slots, 
-                                "SLOT FOUND" if slot_found else "SCANNING")
+        # Determine slot side from tracked slots
+        if self.tracked_slots:
+            slot_side = self._determine_slot_side(self.tracked_slots)
+            self._last_slot_side = slot_side
 
-        return slot_found, frame
+        # ── Step 9: Draw full visualization on frame ─────────────────
+        self._draw_bev_overlay(frame, bev, edges, hough_lines,
+                               raw_pts, clustered, valid_slots,
+                               invalid_rects,
+                               "SLOT FOUND" if slot_found else "SCANNING",
+                               slot_side=slot_side)
+
+        return slot_found, frame, slot_side
+
+    def get_last_slot_side(self):
+        """Return the last detected slot side: 'LEFT', 'RIGHT', or 'NONE'."""
+        return self._last_slot_side
+
+    # ══════════════════════════════════════════════════════════════════
+    #  CORNER CLUSTERING
+    # ══════════════════════════════════════════════════════════════════
 
     def _cluster_corners(self, pts):
         """Merge corners that are very close together into single representative points."""
@@ -168,19 +221,22 @@ class SlotDetector:
 
         return np.array(clusters)
 
-    def _find_rectangles(self, pts):
+    # ══════════════════════════════════════════════════════════════════
+    #  RECTANGLE DETECTION
+    # ══════════════════════════════════════════════════════════════════
+
+    def _find_rectangles_with_rejects(self, pts):
         """
         Find groups of 4 corners that form valid rectangles.
-        
-        Uses the approach: for each combination of 4 points, check if they
-        form a valid rectangle by verifying:
-          1. Order the 4 points into a proper rectangle (TL, TR, BR, BL)
-          2. All 4 angles are approximately 90 degrees
-          3. Opposite sides are approximately equal length
-        """
-        rectangles = []
+        Also returns invalid rectangles (for visualization of rejected candidates).
 
-        # Limit combinations to avoid explosive computation with many corners
+        Returns
+        -------
+        (valid_rectangles, invalid_rectangles)
+        """
+        valid_rectangles = []
+        invalid_rectangles = []
+
         max_pts = min(len(pts), 25)
         search_pts = pts[:max_pts]
 
@@ -191,12 +247,18 @@ class SlotDetector:
                 continue
 
             if self._is_valid_rectangle(ordered):
-                rectangles.append(ordered)
+                valid_rectangles.append(ordered)
+            else:
+                invalid_rectangles.append(ordered)
 
         # Remove duplicate/overlapping rectangles
-        rectangles = self._remove_duplicates(rectangles)
+        valid_rectangles = self._remove_duplicates(valid_rectangles)
 
-        return rectangles
+        # Limit invalid rectangles for drawing (don't flood the display)
+        if len(invalid_rectangles) > 10:
+            invalid_rectangles = invalid_rectangles[:10]
+
+        return valid_rectangles, invalid_rectangles
 
     def _order_points(self, pts):
         """
@@ -292,6 +354,10 @@ class SlotDetector:
 
         return True
 
+    # ══════════════════════════════════════════════════════════════════
+    #  OCCUPANCY CHECK
+    # ══════════════════════════════════════════════════════════════════
+
     def _check_occupancy(self, rect, dets, frame_h, frame_w):
         """
         Check if a detected slot is occupied using YOLO detections.
@@ -322,6 +388,10 @@ class SlotDetector:
                     return True
 
         return False
+
+    # ══════════════════════════════════════════════════════════════════
+    #  DUPLICATE REMOVAL & TRACKING
+    # ══════════════════════════════════════════════════════════════════
 
     def _remove_duplicates(self, rectangles):
         """Remove overlapping rectangles by comparing their centers."""
@@ -364,60 +434,153 @@ class SlotDetector:
 
         self.tracked_slots = new_tracked
 
-    def _draw_bev_overlay(self, frame, bev, edges, corners, valid_slots, status_text):
+    # ══════════════════════════════════════════════════════════════════
+    #  SLOT SIDE DETERMINATION
+    # ══════════════════════════════════════════════════════════════════
+
+    def _determine_slot_side(self, tracked_slots):
         """
-        Draw slot detection visualization on the BEV portion of the frame.
-        Shows: corners as red crosshairs, valid slots as colored rectangles,
-        and overlays the BEV debug view on the camera video.
+        Determine whether the detected slot is to the LEFT or RIGHT
+        of the car's forward direction.
+
+        In BEV space the car is driving "up" (from bottom to top).
+        The BEV frame center x-axis is at x = 320 (for 640-wide BEV).
+
+        - If the slot center is to the LEFT of the BEV center → LEFT slot
+        - If the slot center is to the RIGHT of the BEV center → RIGHT slot
+
+        Returns 'LEFT', 'RIGHT', or 'NONE'.
+        """
+        if not tracked_slots or len(tracked_slots) == 0:
+            return "NONE"
+
+        # Use the first (most confident) tracked slot
+        slot = tracked_slots[0]
+        slot_cx = np.mean(slot[:, 0])  # Average x of 4 corners
+
+        bev_center_x = 320.0  # Half of 640-wide BEV
+
+        if slot_cx < bev_center_x:
+            return "LEFT"
+        else:
+            return "RIGHT"
+
+    # ══════════════════════════════════════════════════════════════════
+    #  FULL VISUALIZATION
+    # ══════════════════════════════════════════════════════════════════
+
+    def _draw_bev_overlay(self, frame, bev, edges, hough_lines,
+                          raw_corners, clustered_corners,
+                          valid_slots, invalid_rects,
+                          status_text, slot_side="NONE"):
+        """
+        Draw comprehensive slot detection visualization.
+
+        Shows on BEV debug view:
+          - Canny edges (green tint)
+          - ALL Hough lines (cyan, thin)
+          - Raw corners before clustering (small red dots)
+          - Clustered corners (green crosshairs)
+          - Invalid candidate rectangles (dim grey dashed)
+          - Valid slots: yellow (free) / red (occupied) borders
+          - Tracked confirmed slots (bright green, thick)
+          - Slot side label (LEFT / RIGHT)
+          - Text annotations with counts
+
+        Also projects confirmed slots onto the original camera frame.
         """
         h, w = frame.shape[:2]
         bev_h, bev_w = bev.shape[:2]
 
-        # Create a BEV debug visualization
+        # Create BEV debug visualization
         bev_dbg = bev.copy()
 
-        # Draw edges as green overlay
+        # ── 1. Draw Canny edges as green overlay ─────────────────────
         edge_color = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
         edge_color[edges > 0] = [0, 180, 0]
-        bev_dbg = cv2.addWeighted(bev_dbg, 0.7, edge_color, 0.3, 0)
+        bev_dbg = cv2.addWeighted(bev_dbg, 0.65, edge_color, 0.35, 0)
 
-        # Draw all detected corners as red crosshairs (+)
-        if len(corners) > 0:
-            for pt in corners:
+        # ── 2. Draw ALL Hough lines (cyan, thin) ─────────────────────
+        num_hough = 0
+        if hough_lines is not None:
+            num_hough = len(hough_lines)
+            for line in hough_lines:
+                x1, y1, x2, y2 = line[0]
+                cv2.line(bev_dbg, (x1, y1), (x2, y2), (255, 255, 0), 1)  # Cyan
+
+        # ── 3. Draw raw corners (small red filled circles) ───────────
+        num_raw = 0
+        if raw_corners is not None and len(raw_corners) > 0:
+            num_raw = len(raw_corners)
+            for pt in raw_corners:
                 cx, cy = int(pt[0]), int(pt[1])
-                size = 8
-                cv2.line(bev_dbg, (cx - size, cy), (cx + size, cy), (0, 0, 255), 2)
-                cv2.line(bev_dbg, (cx, cy - size), (cx, cy + size), (0, 0, 255), 2)
+                cv2.circle(bev_dbg, (cx, cy), 4, (0, 0, 255), -1)  # Red filled
 
-        # Draw valid slot rectangles
+        # ── 4. Draw clustered corners (green crosshairs) ─────────────
+        num_clustered = 0
+        if clustered_corners is not None and len(clustered_corners) > 0:
+            num_clustered = len(clustered_corners)
+            for pt in clustered_corners:
+                cx, cy = int(pt[0]), int(pt[1])
+                size = 10
+                cv2.line(bev_dbg, (cx - size, cy), (cx + size, cy), (0, 255, 0), 2)
+                cv2.line(bev_dbg, (cx, cy - size), (cx, cy + size), (0, 255, 0), 2)
+                # Small label with index
+                cv2.circle(bev_dbg, (cx, cy), 3, (0, 255, 0), -1)
+
+        # ── 5. Draw INVALID candidate rectangles (dim grey) ──────────
+        num_invalid = 0
+        if invalid_rects and len(invalid_rects) > 0:
+            num_invalid = len(invalid_rects)
+            for rect in invalid_rects:
+                pts = rect.astype(np.int32)
+                for j in range(4):
+                    p1 = tuple(pts[j])
+                    p2 = tuple(pts[(j + 1) % 4])
+                    cv2.line(bev_dbg, p1, p2, (100, 100, 100), 1)  # Dim grey
+
+        # ── 6. Draw VALID slot rectangles ────────────────────────────
+        num_valid = 0
+        num_free = 0
         for i, (rect, occupied) in enumerate(valid_slots if valid_slots else []):
+            num_valid += 1
             pts = rect.astype(np.int32)
 
             if occupied:
                 color = (0, 0, 255)      # Red — occupied
                 label = "OCCUPIED"
             else:
+                num_free += 1
                 color = (0, 255, 255)    # Yellow — free slot
                 label = f"SLOT {i+1}"
 
-            # Draw the 4 edges of rectangle
+            # Draw the 4 edges of rectangle (thick)
             for j in range(4):
                 p1 = tuple(pts[j])
                 p2 = tuple(pts[(j + 1) % 4])
                 cv2.line(bev_dbg, p1, p2, color, 2)
 
-            # Draw corner markers (red crosshairs like in user's diagram)
+            # Draw corner markers (bright red crosshairs)
             for pt in pts:
                 cx, cy = pt
-                size = 10
+                size = 12
                 cv2.line(bev_dbg, (cx - size, cy), (cx + size, cy), (0, 0, 255), 3)
                 cv2.line(bev_dbg, (cx, cy - size), (cx, cy + size), (0, 0, 255), 3)
 
-            # Label
-            cv2.putText(bev_dbg, label, (pts[0][0], pts[0][1] - 10),
+            # Slot label
+            cv2.putText(bev_dbg, label, (pts[0][0], pts[0][1] - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # Draw tracked slots (green — confirmed)
+            # Draw slot dimensions text
+            tl, tr, br, bl = rect
+            slot_w = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2.0
+            slot_h = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2.0
+            dim_text = f"{slot_w:.0f}x{slot_h:.0f}px"
+            center = np.mean(pts, axis=0).astype(int)
+            cv2.putText(bev_dbg, dim_text, (center[0] - 30, center[1] + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        # ── 7. Draw tracked / confirmed slots (bright green, thick) ──
         for tracked in self.tracked_slots:
             pts = tracked.astype(np.int32)
             for j in range(4):
@@ -425,44 +588,104 @@ class SlotDetector:
                 p2 = tuple(pts[(j + 1) % 4])
                 cv2.line(bev_dbg, p1, p2, (0, 255, 0), 3)
 
-        # Status text on BEV
-        cv2.putText(bev_dbg, f"BEV SLOT: {status_text}", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.putText(bev_dbg, f"Corners: {len(corners)}", (10, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            # CONFIRMED label
+            center = np.mean(pts, axis=0).astype(int)
+            cv2.putText(bev_dbg, "CONFIRMED", (center[0] - 40, center[1] - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-        # ── Overlay BEV mini-view on the camera frame ────────────────
-        # Place a scaled-down BEV in the top-right corner of the camera frame
-        mini_w, mini_h = 200, 150
+        # ── 8. Draw slot side indicator ──────────────────────────────
+        if slot_side != "NONE":
+            side_color = (255, 200, 0) if slot_side == "LEFT" else (0, 200, 255)
+            cv2.putText(bev_dbg, f"SIDE: {slot_side}", (bev_w - 160, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, side_color, 2)
+
+            # Draw arrow indicating side
+            arrow_y = 80
+            if slot_side == "LEFT":
+                cv2.arrowedLine(bev_dbg, (bev_w - 80, arrow_y),
+                                (bev_w - 150, arrow_y), side_color, 3, tipLength=0.3)
+            else:
+                cv2.arrowedLine(bev_dbg, (bev_w - 150, arrow_y),
+                                (bev_w - 80, arrow_y), side_color, 3, tipLength=0.3)
+
+        # ── 9. Draw BEV center line (reference for LEFT/RIGHT) ───────
+        cv2.line(bev_dbg, (bev_w // 2, 0), (bev_w // 2, bev_h),
+                 (255, 255, 255), 1)  # White dashed center line
+        cv2.putText(bev_dbg, "CENTER", (bev_w // 2 - 25, bev_h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
+
+        # ── 10. Text annotations (top-left panel) ────────────────────
+        info_lines = [
+            f"BEV SLOT: {status_text}",
+            f"Hough Lines: {num_hough}",
+            f"Raw Corners: {num_raw}",
+            f"Clustered: {num_clustered}",
+            f"Rects (invalid): {num_invalid}",
+            f"Valid Slots: {num_valid} (Free: {num_free})",
+            f"Tracked: {len(self.tracked_slots)}",
+        ]
+
+        # Draw semi-transparent background for text panel
+        panel_h = 20 + len(info_lines) * 22
+        overlay = bev_dbg.copy()
+        cv2.rectangle(overlay, (0, 0), (220, panel_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.5, bev_dbg, 0.5, 0, bev_dbg)
+
+        for idx, text in enumerate(info_lines):
+            y_pos = 20 + idx * 22
+            # First line is status — use yellow
+            color = (0, 255, 255) if idx == 0 else (200, 200, 200)
+            thickness = 2 if idx == 0 else 1
+            font_scale = 0.55 if idx == 0 else 0.45
+            cv2.putText(bev_dbg, text, (8, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
+
+        # ── 11. Overlay BEV mini-view on the camera frame ────────────
+        # Use a LARGER mini-view so all details are visible
+        mini_w, mini_h = 280, 210
         bev_mini = cv2.resize(bev_dbg, (mini_w, mini_h))
 
         # Position: top-right with margin
         x_off = w - mini_w - 10
         y_off = 10
 
-        # Border
-        cv2.rectangle(frame, (x_off - 2, y_off - 2),
-                      (x_off + mini_w + 2, y_off + mini_h + 2),
+        # Border with label
+        cv2.rectangle(frame, (x_off - 3, y_off - 18),
+                      (x_off + mini_w + 3, y_off - 1),
+                      (0, 120, 200), -1)
+        cv2.putText(frame, "BEV SLOT DETECTOR", (x_off + 5, y_off - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.rectangle(frame, (x_off - 3, y_off - 3),
+                      (x_off + mini_w + 3, y_off + mini_h + 3),
                       (0, 255, 255), 2)
 
         # Only overlay if frame is large enough
         if x_off > 0 and y_off + mini_h < h:
             frame[y_off:y_off + mini_h, x_off:x_off + mini_w] = bev_mini
 
-        # Also project detected slots back onto the original camera frame
+        # ── 12. Project confirmed slots back onto camera frame ───────
         for tracked in self.tracked_slots:
             cam_pts = cv2.perspectiveTransform(
                 tracked.reshape(1, -1, 2).astype(np.float32), self.M_inv
             ).reshape(-1, 2).astype(np.int32)
 
+            # Draw slot border on camera view (bright green)
             for j in range(4):
                 p1 = tuple(cam_pts[j])
                 p2 = tuple(cam_pts[(j + 1) % 4])
                 cv2.line(frame, p1, p2, (0, 255, 0), 2)
 
-            # Corner markers on camera view too
+            # Corner markers on camera view
             for pt in cam_pts:
                 cx, cy = pt
-                size = 6
+                size = 8
                 cv2.line(frame, (cx - size, cy), (cx + size, cy), (0, 0, 255), 2)
                 cv2.line(frame, (cx, cy - size), (cx, cy + size), (0, 0, 255), 2)
+
+            # Side label on camera view
+            if slot_side != "NONE":
+                cam_center = np.mean(cam_pts, axis=0).astype(int)
+                side_color = (255, 200, 0) if slot_side == "LEFT" else (0, 200, 255)
+                cv2.putText(frame, f"{slot_side} SLOT",
+                            (cam_center[0] - 35, cam_center[1] - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, side_color, 2)

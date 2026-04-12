@@ -165,6 +165,7 @@ class BFMC_App:
         self.SLOT_CONFIRM_THRESHOLD = 3       # Need 3 consecutive frames to confirm
         self.SLOT_SEARCH_TIMEOUT = 60.0       # Give up after 60 seconds
         self.slot_detected_frame = None        # Frame with slot detection overlay
+        self.detected_slot_side = "NONE"       # LEFT / RIGHT / NONE
 
         # Autonomous Pipelines (Lane Detection)
         self.is_auto_mode    = False
@@ -460,6 +461,128 @@ class BFMC_App:
             mode_str = "REVERSE" if reverse else "FORWARD"
             self.ui.log_event(f"Starting {mode_str} parking (CSV)...", "SUCCESS")
 
+    def _execute_auto_park(self, slot_side="RIGHT"):
+        """
+        Execute auto-parking based on detected slot side.
+        No CSV file needed — uses hardcoded time-based maneuver sequence.
+
+        Parameters
+        ----------
+        slot_side : str — "LEFT" or "RIGHT" (default RIGHT)
+
+        LEFT slot:  car drives forward, then reverses with POSITIVE steer (+22°)
+        RIGHT slot: car drives forward, then reverses with NEGATIVE steer (-22°)
+        """
+        sequence = self._get_auto_park_sequence(slot_side)
+
+        FRAME_PERIOD = 0.05  # 50ms per frame (20 Hz control loop)
+
+        commands = []
+        for speed, steer, duration_s in sequence:
+            num_frames = max(1, int(round(duration_s / FRAME_PERIOD)))
+            direction = 1 if speed > 0 else (-1 if speed < 0 else 0)
+            commands.append({
+                "speed": abs(speed),
+                "steer": steer,
+                "pwm": abs(speed),
+                "direction": direction,
+                "duration_fr": num_frames
+            })
+
+        self.playback_queue = commands
+        self.is_parking_reverse_mode = False
+        self.is_playing_back = True
+        self.is_auto_mode = False
+        self.is_calibrating = False
+
+        if not self.headless:
+            self.ui.log_event(f"🅿️ AUTO-PARK ({slot_side} slot) — {len(sequence)} phases", "SUCCESS")
+
+    def _get_auto_park_sequence(self, slot_side="RIGHT"):
+        """
+        Return time-based parking maneuver sequence for the given slot side.
+
+        Each step: (speed_pwm, steering_angle_deg, duration_seconds)
+          - speed > 0  = forward
+          - speed < 0  = reverse
+          - speed = 0  = stop
+          - steering: negative = left, positive = right
+
+        LEFT SLOT:
+          Car is to the right of the slot. Drive forward past it, then
+          reverse with POSITIVE steering (+22°) to arc left into the slot.
+
+        RIGHT SLOT:
+          Car is to the left of the slot. Drive forward past it, then
+          reverse with NEGATIVE steering (-22°) to arc right into the slot.
+        """
+        if slot_side == "LEFT":
+            # ── LEFT SLOT PARKING SEQUENCE ────────────────────────────
+            return [
+                # Phase 0: Brief stop (stabilize)
+                (   0.0,    0.0,   0.50),
+
+                # Phase 1: Drive forward past the slot
+                ( 200.0,    0.0,   1.50),   # Forward straight 1.5s
+
+                # Phase 2: Brief stop before reversing
+                (   0.0,    0.0,   0.50),
+
+                # Phase 3: Reverse with POSITIVE steer (arcs LEFT into slot)
+                (-180.0,   22.0,   2.00),   # Reverse + right steer → car arcs left
+
+                # Phase 4: Counter-steer to straighten in the slot
+                (-150.0,  -10.0,   1.00),   # Reverse + left correction
+
+                # Phase 5: Brief straighten
+                (-100.0,    0.0,   0.50),   # Reverse straight (tuck in)
+
+                # Phase 6: Stop — parked
+                (   0.0,    0.0,   3.00),   # Hold stop for 3 seconds
+
+                # Phase 7: Exit forward with opposite steer
+                ( 180.0,  -15.0,   1.50),   # Forward + left steer to exit
+
+                # Phase 8: Straighten after exit
+                ( 150.0,    0.0,   0.50),   # Forward straight
+
+                # Phase 9: Final stop
+                (   0.0,    0.0,   1.00),
+            ]
+        else:
+            # ── RIGHT SLOT PARKING SEQUENCE ───────────────────────────
+            return [
+                # Phase 0: Brief stop (stabilize)
+                (   0.0,    0.0,   0.50),
+
+                # Phase 1: Drive forward past the slot (shorter — slot is closer)
+                ( 200.0,    0.0,   1.00),   # Forward straight 1.0s
+
+                # Phase 2: Brief stop before reversing
+                (   0.0,    0.0,   0.50),
+
+                # Phase 3: Reverse with NEGATIVE steer (arcs RIGHT into slot)
+                (-180.0,  -22.0,   2.00),   # Reverse + left steer → car arcs right
+
+                # Phase 4: Counter-steer to straighten in the slot
+                (-150.0,   10.0,   1.00),   # Reverse + right correction
+
+                # Phase 5: Brief straighten
+                (-100.0,    0.0,   0.50),   # Reverse straight (tuck in)
+
+                # Phase 6: Stop — parked
+                (   0.0,    0.0,   3.00),   # Hold stop for 3 seconds
+
+                # Phase 7: Exit forward with opposite steer
+                ( 180.0,   15.0,   1.50),   # Forward + right steer to exit
+
+                # Phase 8: Straighten after exit
+                ( 150.0,    0.0,   0.50),   # Forward straight
+
+                # Phase 9: Final stop
+                (   0.0,    0.0,   1.00),
+            ]
+
     def render_map(self):
         if self.headless: return
         pil = self.map_engine.render_map(
@@ -622,10 +745,12 @@ class BFMC_App:
                     # Build minimal detection list from labels if full dets not available
                     yolo_dets = []
                 
-                slot_found_this_frame, frame = self.slot_detector.detect_slot(frame, yolo_dets)
+                # detect_slot now returns (found, frame, slot_side)
+                slot_found_this_frame, frame, slot_side = self.slot_detector.detect_slot(frame, yolo_dets)
                 
                 if slot_found_this_frame:
                     self.slot_confirm_count += 1
+                    self.detected_slot_side = slot_side  # Track which side
                 else:
                     self.slot_confirm_count = max(0, self.slot_confirm_count - 1)
                 
@@ -633,9 +758,10 @@ class BFMC_App:
                 if self.slot_confirm_count >= self.SLOT_CONFIRM_THRESHOLD:
                     self.is_searching_slot = False
                     self.has_parked_here = True
-                    self.execute_parking_playback(reverse=False)
+                    # Auto-park based on detected slot side (no CSV needed)
+                    self._execute_auto_park(self.detected_slot_side)
                     if not self.headless:
-                        self.ui.log_event("✅ SLOT CONFIRMED! Starting parking maneuver...", "SUCCESS")
+                        self.ui.log_event(f"✅ SLOT CONFIRMED ({self.detected_slot_side})! Auto-parking...", "SUCCESS")
                 
                 # Check for timeout
                 elif time.time() - self.slot_search_start_time > self.SLOT_SEARCH_TIMEOUT:
